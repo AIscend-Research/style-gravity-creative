@@ -214,3 +214,122 @@ def test_analyse_produces_a_curve_end_to_end():
 def test_analyse_rejects_an_empty_corpus():
     with pytest.raises(ValueError):
         analyse([])
+
+
+# --------------------------------------------------------------------------- #
+# sustain condition + plan construction
+# --------------------------------------------------------------------------- #
+
+def test_mode_composition_round_trips():
+    from stylegravity.generate import compose_mode, split_mode as sm
+    assert compose_mode("prefill", True) == "prefill+sustain"
+    assert compose_mode("prefill", False) == "prefill"
+    assert sm("prefill+sustain") == ("prefill", True)
+    assert sm("instructed") == ("instructed", False)
+
+
+def test_sustain_is_rejected_for_baselines():
+    """A system-prompted baseline is no longer the *unprompted* house style, so
+    it could not serve as the metric's second pole."""
+    from stylegravity.generate import GenerationError, generate
+    with pytest.raises(GenerationError, match="does not apply to baselines"):
+        generate(None, model_id="claude-haiku-4-5", mode="baseline+sustain",
+                 seed=None, sample=0, n_lines=4, max_tokens=100, temperature=1.0)
+
+
+def test_prefill_is_refused_on_models_that_would_400():
+    from stylegravity.generate import GenerationError, generate
+    with pytest.raises(GenerationError, match="does not support assistant prefill"):
+        generate(None, model_id="claude-opus-5", mode="prefill",
+                 seed=resolve_seed("skaldic"), sample=0, n_lines=4,
+                 max_tokens=100, temperature=1.0)
+
+
+def test_old_cached_generations_load_without_the_system_field():
+    """A run bought before the sustain condition existed must not need re-buying."""
+    import json
+    from stylegravity.generate import Generation
+    legacy = {"model": "claude-haiku-4-5", "mode": "prefill", "seed_id": "skaldic",
+              "sample": 0, "text": "x", "stop_reason": "end_turn", "input_tokens": 1,
+              "output_tokens": 1, "cost_usd": 0.0, "prompt": "p", "prefill": None}
+    rec = Generation(**json.loads(json.dumps(legacy)))
+    assert rec.system is None
+
+
+def _plan_args(**kw):
+    import argparse
+    base = dict(preset="full", models=None, seeds=None, samples=None,
+                baseline_samples=None, lines=24, max_tokens=1200,
+                temperature=1.0, concurrency=8)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_full_preset_covers_all_four_conditions():
+    from stylegravity.cli import _plan
+    jobs = _plan(_plan_args())
+    modes = {m for _mid, m, _s, _i in jobs}
+    assert modes == {"baseline", "prefill", "prefill+sustain",
+                     "instructed", "instructed+sustain"}
+
+
+def test_full_preset_never_schedules_prefill_on_a_model_that_would_400():
+    from stylegravity.cli import _plan
+    from stylegravity.models import resolve as rm
+    for mid, mode, _s, _i in _plan(_plan_args()):
+        if mode.startswith("prefill"):
+            assert rm(mid).prefill, f"{mid} would 400 on prefill"
+
+
+def test_prefill_and_instructed_run_on_the_same_model():
+    """The de-confounding requirement: without this, channel is perfectly
+    correlated with model generation and neither can be attributed."""
+    from stylegravity.cli import _plan
+    jobs = _plan(_plan_args())
+    by_model = {}
+    for mid, mode, _s, _i in jobs:
+        by_model.setdefault(mid, set()).add(mode.split("+")[0])
+    assert any({"prefill", "instructed"} <= v for v in by_model.values())
+
+
+def test_every_model_in_the_plan_gets_baselines():
+    from stylegravity.cli import _plan
+    jobs = _plan(_plan_args())
+    models = {mid for mid, _m, _s, _i in jobs}
+    with_base = {mid for mid, m, _s, _i in jobs if m == "baseline"}
+    assert models == with_base
+
+
+def test_plan_has_no_duplicate_cells():
+    from stylegravity.cli import _plan
+    jobs = _plan(_plan_args())
+    keys = [(mid, m, s.id if s else "-", i) for mid, m, s, i in jobs]
+    assert len(keys) == len(set(keys))
+
+
+def test_plan_filters_respect_explicit_models_and_seeds():
+    from stylegravity.cli import _plan
+    jobs = _plan(_plan_args(models=["claude-haiku-4-5"], seeds=["skaldic"]))
+    assert {mid for mid, _m, _s, _i in jobs} == {"claude-haiku-4-5"}
+    assert {s.id for _m, _md, s, _i in jobs if s} == {"skaldic"}
+
+
+def test_store_is_safe_under_concurrent_writers(tmp_path):
+    """Concurrent workers must not interleave a half-written JSON line — a torn
+    line makes the whole cache unreadable on reload."""
+    import threading
+    from stylegravity.generate import Generation, GenerationStore
+    store = GenerationStore(tmp_path / "g.jsonl")
+
+    def push(i):
+        store.add(Generation(model="m", mode="prefill", seed_id="s", sample=i,
+                             text="line\n" * 3, stop_reason="end_turn",
+                             input_tokens=1, output_tokens=1, cost_usd=0.01,
+                             prompt="p", prefill=None))
+
+    threads = [threading.Thread(target=push, args=(i,)) for i in range(40)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    reloaded = GenerationStore(tmp_path / "g.jsonl")
+    assert len(reloaded.records) == 40
+    assert reloaded.total_cost() == pytest.approx(0.40)

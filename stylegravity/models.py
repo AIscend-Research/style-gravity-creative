@@ -28,50 +28,52 @@ class ModelSpec:
     output_price: float
     #  Models on the 4.7+ line reject temperature/top_p/top_k outright.
     sampling_params: bool = True
+    #  Rough streaming output throughput, used only by the time estimator.
+    tokens_per_second: float = 55.0
 
 
 REGISTRY: dict[str, ModelSpec] = {
     # ---- prefill-capable: the models this experiment can actually run on ----
     "claude-haiku-4-5": ModelSpec(
         "claude-haiku-4-5", "Haiku 4.5", prefill=True,
-        input_price=1.00, output_price=5.00,
+        input_price=1.00, output_price=5.00, tokens_per_second=110.0,
     ),
     "claude-sonnet-4-5": ModelSpec(
         "claude-sonnet-4-5", "Sonnet 4.5", prefill=True,
-        input_price=3.00, output_price=15.00,
+        input_price=3.00, output_price=15.00, tokens_per_second=65.0,
     ),
     "claude-sonnet-4-0": ModelSpec(
         "claude-sonnet-4-0", "Sonnet 4", prefill=True,
-        input_price=3.00, output_price=15.00,
+        input_price=3.00, output_price=15.00, tokens_per_second=65.0,
     ),
     "claude-opus-4-5": ModelSpec(
         "claude-opus-4-5", "Opus 4.5", prefill=True,
-        input_price=5.00, output_price=25.00,
+        input_price=5.00, output_price=25.00, tokens_per_second=40.0,
     ),
     "claude-opus-4-1": ModelSpec(
         "claude-opus-4-1", "Opus 4.1", prefill=True,
-        input_price=15.00, output_price=75.00,
+        input_price=15.00, output_price=75.00, tokens_per_second=30.0,
     ),
     # ---- prefill removed: measurable only in `instructed` mode ----
     "claude-opus-4-6": ModelSpec(
         "claude-opus-4-6", "Opus 4.6", prefill=False,
-        input_price=5.00, output_price=25.00,
+        input_price=5.00, output_price=25.00, tokens_per_second=40.0,
     ),
     "claude-sonnet-4-6": ModelSpec(
         "claude-sonnet-4-6", "Sonnet 4.6", prefill=False,
-        input_price=3.00, output_price=15.00,
+        input_price=3.00, output_price=15.00, tokens_per_second=65.0,
     ),
     "claude-opus-4-8": ModelSpec(
         "claude-opus-4-8", "Opus 4.8", prefill=False,
-        input_price=5.00, output_price=25.00, sampling_params=False,
+        input_price=5.00, output_price=25.00, sampling_params=False, tokens_per_second=40.0,
     ),
     "claude-sonnet-5": ModelSpec(
         "claude-sonnet-5", "Sonnet 5", prefill=False,
-        input_price=3.00, output_price=15.00, sampling_params=False,
+        input_price=3.00, output_price=15.00, sampling_params=False, tokens_per_second=65.0,
     ),
     "claude-opus-5": ModelSpec(
         "claude-opus-5", "Opus 5", prefill=False,
-        input_price=5.00, output_price=25.00, sampling_params=False,
+        input_price=5.00, output_price=25.00, sampling_params=False, tokens_per_second=40.0,
     ),
 }
 

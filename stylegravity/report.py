@@ -19,8 +19,30 @@ from .drift import DriftCurve
 from .models import resolve as resolve_model
 from .seeds import resolve as resolve_seed
 
-SERIES_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
-SERIES_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300"]
+#  Two encodings, because a cell is identified by two things. Colour carries the
+#  model (categorical slots, validated all-pairs in both modes); dash pattern
+#  carries the channel/condition. Folding both into colour would need 20 hues,
+#  far past the point where any palette stays colourblind-safe.
+DASH = {
+    "prefill": "",
+    "prefill+sustain": ' stroke-dasharray="7 3"',
+    "instructed": ' stroke-dasharray="2 3"',
+    "instructed+sustain": ' stroke-dasharray="7 3 2 3"',
+}
+
+
+def series_label(curve) -> str:
+    return f"{resolve_model(curve.model).label} · {curve.mode}"
+
+
+def _slot(curves, curve) -> int:
+    """Colour slot by model, so the same model keeps its colour across every
+    condition in the facet."""
+    models = []
+    for c in curves:
+        if c.model not in models:
+            models.append(c.model)
+    return models.index(curve.model) % 6
 
 CSS = """
 :root { color-scheme: light dark; }
@@ -129,14 +151,14 @@ def _chart(curves: list[DriftCurve], *, width: int = 880, height: int = 300) -> 
     )
 
     for idx, curve in enumerate(curves):
-        color = f"var(--s{(idx % 6) + 1})"
+        color = f"var(--s{_slot(curves, curve) + 1})"
         g = curve.gravity
         if not g:
             continue
         pts = " ".join(f"{px(i):.1f},{py(v):.1f}" for i, v in enumerate(g))
         parts.append(
             f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2" '
-            f'stroke-linejoin="round" stroke-linecap="round"/>'
+            f'stroke-linejoin="round" stroke-linecap="round"{DASH.get(curve.mode, "")}/>'
         )
         # reclamation marker: 2px surface ring so overlapping markers stay legible
         if curve.reclamation_line:
@@ -145,11 +167,13 @@ def _chart(curves: list[DriftCurve], *, width: int = 880, height: int = 300) -> 
                 f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="4.5" fill="{color}" '
                 f'stroke="var(--surface-1)" stroke-width="2"/>'
             )
-        label = resolve_model(curve.model).label
+        # Direct label at the end of each line: the relief rule for the light-mode
+        # aqua slot, and it keeps identity off colour alone.
+        label = series_label(curve)
         parts.append(
-            f'<text x="{px(len(g) - 1) + 9:.1f}" y="{py(g[-1]) + 4:.1f}" font-size="11.5" '
+            f'<text x="{px(len(g) - 1) + 9:.1f}" y="{py(g[-1]) + 4:.1f}" font-size="10.5" '
             f'fill="var(--text-primary)">'
-            f'<tspan fill="{color}">■ </tspan>{html.escape(label)}</text>'
+            f'<tspan fill="{color}">\u25a0 </tspan>{html.escape(label)}</text>'
         )
         parts.append(f"<title>{html.escape(label)}</title>")
 
@@ -158,13 +182,26 @@ def _chart(curves: list[DriftCurve], *, width: int = 880, height: int = 300) -> 
 
 
 def _legend(curves: list[DriftCurve]) -> str:
-    items = []
-    for idx, c in enumerate(curves):
-        color = f"var(--s{(idx % 6) + 1})"
-        items.append(
-            f'<span><span class="swatch" style="background:{color}"></span>'
-            f"{html.escape(resolve_model(c.model).label)}</span>"
-        )
+    models, modes = [], []
+    for c in curves:
+        if c.model not in models:
+            models.append(c.model)
+        if c.mode not in modes:
+            modes.append(c.mode)
+    items = [
+        f'<span><span class="swatch" style="background:var(--s{i + 1})"></span>'
+        f"{html.escape(resolve_model(m).label)}</span>"
+        for i, m in enumerate(models)
+    ]
+    if len(modes) > 1:
+        for mode in modes:
+            dash = DASH.get(mode, "")
+            style = "3 2" if "dasharray" in dash else "none"
+            items.append(
+                f'<span><svg width="22" height="8" style="vertical-align:middle">'
+                f'<line x1="0" y1="4" x2="22" y2="4" stroke="var(--text-secondary)" '
+                f'stroke-width="2"{dash}/></svg> {html.escape(mode)}</span>'
+            )
     return f'<div class="legend">{"".join(items)}</div>'
 
 
@@ -178,8 +215,8 @@ def _fmt(v, digits: int = 2, dash: str = "—") -> str:
 
 def _table(curves: list[DriftCurve]) -> str:
     rows = []
-    for idx, c in enumerate(curves):
-        color = f"var(--s{(idx % 6) + 1})"
+    for c in curves:
+        color = f"var(--s{_slot(curves, c) + 1})"
         ci = c.reclamation_ci or (None, None)
         ci_txt = f"{ci[0]}–{ci[1]}" if ci[0] is not None else "—"
         recl = str(c.reclamation_line) if c.reclamation_line else f">{len(c.gravity)}"

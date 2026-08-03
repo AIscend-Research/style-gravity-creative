@@ -122,21 +122,55 @@ disagree, believe the tell and fix the metric.
 
 ---
 
+## The four conditions
+
+The experiment crosses two channels with two levels of explicit instruction. The contrast
+between a cell and its `+sustain` twin is the paper's central measurement: **what asking, in
+words, can recover of what the prefill affordance used to give you structurally.**
+
+| mode | channel | asked to sustain the style? |
+|---|---|---|
+| `prefill` | seed as the model's own in-progress output | no |
+| `prefill+sustain` | same | yes, via system prompt |
+| `instructed` | seed as someone else's text in the user turn | no |
+| `instructed+sustain` | same | yes, via system prompt |
+| `baseline` | no seed at all — the house-style pole | n/a |
+
+`sustain` never names a style (that would leak the answer, and the twelve seeds span registers
+no single description covers). It asks the model to hold the opening's diction, syntax, line
+shape, punctuation, formality, and any formal constraint it appears to be observing.
+
+All four conditions run on the **same** prefill-capable models, which is what de-confounds
+channel from model generation — without that, "prefill vs instructed" is perfectly correlated
+with "2025-era vs current model" and neither can be attributed.
+
 ## Usage
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e .
 export ANTHROPIC_API_KEY=...          # or: ant auth login
 
-python -m stylegravity estimate       # cost, no API calls
-python -m stylegravity run --run-dir runs/pilot
-python -m stylegravity analyse --run-dir runs/pilot   # re-score, no API calls
+python -m stylegravity presets                          # what each preset runs
+python -m stylegravity estimate --preset full           # cost + wall clock, no API calls
+python -m stylegravity run --preset full --run-dir runs/full
+python -m stylegravity analyse --run-dir runs/full      # re-score, no API calls
 ```
 
-Defaults: three models × four seeds × 5 samples, plus 8 baselines per model — 84 calls,
-**upper bound $1.54**, typically $0.85–$1.23. The estimate assumes every generation runs to
-`--max-tokens`; an estimate you can exceed is worse than useless when the budget claim is
-"dollars."
+| preset | calls | typical cost | wall clock @ `--concurrency 8` | what it is |
+|---|---|---|---|---|
+| `pilot` | 26 | $0.11 | <1 min | smoke test, one model |
+| `default` | 84 | $1.03 | ~1 min | core sweep, prefill only |
+| `full` | 940 | **$12.22** (ceiling $18.81) | **~15 min** | the whole paper |
+
+`full` is a deliberate two-tier design, not a full factorial: all twelve seeds in the headline
+condition (breadth), four conditions on the four core seeds (depth), plus the current-generation
+models on the instructed channel. Crossing everything would quadruple the bill to answer
+questions no one asked.
+
+Cost estimates assume every generation runs to `--max-tokens`; real spend lands near the
+"typical" column because poems stop on their own. The time figure is derived from published
+throughput and **ignores rate-limit backoff** — on a low API tier, 429s dominate it. Drop
+`--concurrency` if you see them.
 
 A run writes three files to `--run-dir`:
 
@@ -148,11 +182,12 @@ A run writes three files to `--run-dir`:
 
 Generation is the expensive part; analysis is free. Caching the raw poems means the metric can
 be re-tuned and re-argued about without spending another cent, and it leaves every number
-auditable by anyone who doubts it. `run` resumes from cache, so an interrupted run costs nothing
-to restart, and baselines are generated first so a partial run still leaves each model with a
-usable house-style pole.
+auditable by anyone who doubts it. `run` resumes from cache — an interrupted run costs nothing
+to restart, and re-running after failures retries only the failed cells. Baselines are generated
+first, so even a partial run leaves every model with a usable house-style pole.
 
-Useful knobs: `--models`, `--seeds`, `--samples`, `--lines`, `--window`, `--temperature`.
+Useful knobs: `--models`, `--seeds`, `--samples`, `--concurrency`, `--lines`, `--window`,
+`--temperature`.
 
 ---
 

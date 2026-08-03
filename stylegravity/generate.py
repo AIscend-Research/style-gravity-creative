@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -217,6 +218,7 @@ def generate(
             cost_usd=_cost(spec, message.usage),
             prompt=prompt,
             prefill=prefill,
+            system=system,
         )
 
     raise GenerationError(f"{spec.id} {mode}: exhausted retries ({last_err})")
@@ -238,56 +240,69 @@ class GenerationStore:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
         self._records: list[Generation] = []
+        self._keys: set[tuple[str, str, str, int]] = set()
         if self.path.exists():
             for line in self.path.read_text(encoding="utf-8").splitlines():
                 if line.strip():
-                    self._records.append(Generation(**json.loads(line)))
+                    rec = Generation(**json.loads(line))
+                    self._records.append(rec)
+                    if rec.error is None:
+                        self._keys.add((rec.model, rec.mode, rec.seed_id, rec.sample))
 
     @property
     def records(self) -> list[Generation]:
-        return list(self._records)
+        with self._lock:
+            return list(self._records)
 
     def has(self, model: str, mode: str, seed_id: str, sample: int) -> bool:
-        return any(
-            r.model == model and r.mode == mode
-            and r.seed_id == seed_id and r.sample == sample and r.error is None
-            for r in self._records
-        )
+        return (model, mode, seed_id, sample) in self._keys
 
     def add(self, gen: Generation) -> None:
-        self._records.append(gen)
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(gen.to_dict(), ensure_ascii=False) + "\n")
+        # Serialised so concurrent workers cannot interleave a half-written JSON
+        # line — a torn line would make the whole cache unreadable on reload.
+        with self._lock:
+            self._records.append(gen)
+            self._keys.add((gen.model, gen.mode, gen.seed_id, gen.sample))
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(gen.to_dict(), ensure_ascii=False) + "\n")
+                fh.flush()
 
     def total_cost(self) -> float:
-        return sum(r.cost_usd for r in self._records)
+        with self._lock:
+            return sum(r.cost_usd for r in self._records)
 
 
-def estimate_cost(
+def estimate_jobs(
+    jobs: list[tuple[str, str, object, int]],
     *,
-    model_ids: list[str],
-    n_seeds: int,
-    samples: int,
-    baseline_samples: int,
     max_tokens: int,
-    approx_input_tokens: int = 120,
-) -> float:
-    """Upper-bound cost estimate: assumes every generation runs to ``max_tokens``.
+    concurrency: int = 1,
+    approx_input_tokens: int = 260,
+) -> tuple[float, float, float]:
+    """``(upper_cost, typical_cost, wall_clock_seconds)`` for a concrete job list.
 
-    Real spend is typically well under this, since poems stop on their own — but
-    an estimate that can be exceeded is worse than useless when the whole budget
-    claim is 'dollars'.
+    Cost upper bound assumes every generation runs to ``max_tokens``. Real spend
+    lands well under it because poems stop on their own — but an estimate you can
+    exceed is worse than useless when the budget claim is 'dollars'.
+
+    The time figure is an estimate from published throughput, not a measurement,
+    and it ignores rate-limit backoff. On a low API tier a 429 storm dominates
+    everything here.
     """
-    total = 0.0
-    for mid in model_ids:
-        spec = resolve_model(mid)
-        calls = n_seeds * samples + baseline_samples
-        total += calls * (
+    upper = 0.0
+    serial_seconds = 0.0
+    for model_id, _mode, _seed, _sample in jobs:
+        spec = resolve_model(model_id)
+        upper += (
             approx_input_tokens * spec.input_price / 1_000_000
             + max_tokens * spec.output_price / 1_000_000
         )
-    return total
+        #  ~380 output tokens for a 24-line poem, at each tier's rough
+        #  streaming throughput, plus fixed request overhead.
+        serial_seconds += 380 / spec.tokens_per_second + 1.2
+    return upper, upper * 0.65, serial_seconds / max(concurrency, 1)
 
 
 def make_client() -> anthropic.Anthropic:
