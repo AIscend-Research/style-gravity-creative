@@ -1,2 +1,2 @@
 # manuscript
-genetic criticism applied to LLM extended-thinking traces
+text domain attractor decay
