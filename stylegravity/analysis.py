@@ -6,10 +6,12 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .drift import DriftCurve, Scaler, build_curve, fit_run_scaler
+from .drift import (
+    Contrast, DriftCurve, Scaler, build_curve, fit_run_scaler, paired_contrast,
+)
 from .features import poem_features, split_lines
-from .generate import MODE_BASELINE, Generation
-from .seeds import Seed, resolve as resolve_seed
+from .generate import MODE_BASELINE, SUSTAIN, Generation, split_mode
+from .seeds import SEEDS, Seed, resolve as resolve_seed
 
 
 @dataclass
@@ -18,6 +20,7 @@ class RunAnalysis:
     scaler: Scaler
     n_generations: int
     total_cost_usd: float
+    contrasts: list[Contrast] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -25,7 +28,12 @@ class RunAnalysis:
             "n_generations": self.n_generations,
             "total_cost_usd": round(self.total_cost_usd, 4),
             "notes": self.notes,
+            #  Persisted so a later `analyse` can reuse the exact feature space
+            #  this run was scored in, rather than re-deriving one that may
+            #  differ if the model set changes.
+            "scaler": self.scaler.to_dict(),
             "curves": [c.to_dict() for c in self.curves],
+            "contrasts": [c.to_dict() for c in self.contrasts],
         }
 
     def write_json(self, path: Path) -> None:
@@ -59,8 +67,14 @@ def analyse(
     window: int = 2,
     min_support: int = 2,
     max_lines: int | None = None,
+    scaler: Scaler | None = None,
 ) -> RunAnalysis:
     usable = [r for r in records if r.error is None and r.text.strip()]
+    if not usable:
+        #  Checked here rather than on the feature pool: the pool now always
+        #  contains the static seed texts, so it is never empty even when the
+        #  run produced nothing. "No generations" is the real error condition.
+        raise ValueError("no usable generations to analyse")
     notes: list[str] = []
 
     # ---- group ---------------------------------------------------------- #
@@ -80,21 +94,24 @@ def analyse(
                 (rec.model, rec.mode, rec.seed_id), {}
             )[rec.sample] = lines
 
-    # ---- one feature space for the whole run ---------------------------- #
-    pool: list[list[float]] = []
-    for group in baselines.values():
-        for lines in group:
-            pool.extend(poem_features(lines))
-    for by_sample in continuations.values():
-        for lines in by_sample.values():
-            pool.extend(poem_features(lines))
-    seed_ids = {k[2] for k in continuations}
-    for sid in seed_ids:
-        pool.extend(poem_features(resolve_seed(sid).lines))
-
-    if not pool:
-        raise ValueError("no usable generations to analyse")
-    scaler = fit_run_scaler(pool)
+    # ---- one feature space, fixed by the poles rather than by the run ---- #
+    #  Reference = every seed text in the repo (static) + this run's baselines.
+    #  Deliberately excludes the continuations: they are what is being measured,
+    #  and letting them set the scale made the metric depend on which cells the
+    #  run happened to contain, so a subset re-analysis disagreed with the full
+    #  run on the same cell. Seeds are included so no feature ends up with
+    #  near-zero reference variance — the baselines alone are too homogeneous on
+    #  exactly the axes the off-distribution seeds are built to move.
+    if scaler is None:
+        pool: list[list[float]] = []
+        for group in baselines.values():
+            for lines in group:
+                pool.extend(poem_features(lines))
+        for s in SEEDS:
+            pool.extend(poem_features(s.lines))
+        if not pool:
+            raise ValueError("no usable generations to analyse")
+        scaler = fit_run_scaler(pool)
 
     # ---- curves ---------------------------------------------------------- #
     curves: list[DriftCurve] = []
@@ -124,10 +141,30 @@ def analyse(
             )
         )
 
+    # ---- the central comparison: each cell against its +sustain twin ----- #
+    by_key = {(c.model, c.mode, c.seed): c for c in curves}
+    contrasts: list[Contrast] = []
+    for (model, mode, seed_id), plain in sorted(by_key.items()):
+        base, sustained = split_mode(mode)
+        if sustained:
+            continue                       # reached from the plain arm below
+        twin = by_key.get((model, f"{base}+{SUSTAIN}", seed_id))
+        if twin is None:
+            continue
+        if not (plain.valid and twin.valid):
+            notes.append(
+                f"no contrast for {model}/{base}/{seed_id}: one arm failed the "
+                "pole-separation check, so the difference between them is not "
+                "a measurement of sustaining"
+            )
+            continue
+        contrasts.append(paired_contrast(plain, twin, window=window))
+
     return RunAnalysis(
         curves=curves,
         scaler=scaler,
         n_generations=len(usable),
         total_cost_usd=sum(r.cost_usd for r in records),
+        contrasts=contrasts,
         notes=notes,
     )

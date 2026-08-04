@@ -333,3 +333,161 @@ def test_store_is_safe_under_concurrent_writers(tmp_path):
     reloaded = GenerationStore(tmp_path / "g.jsonl")
     assert len(reloaded.records) == 40
     assert reloaded.total_cost() == pytest.approx(0.40)
+
+
+# --------------------------------------------------------------------------- #
+# paired contrast: a cell against its +sustain twin
+# --------------------------------------------------------------------------- #
+
+def _curve(mode, samples, model="m", seed="skaldic"):
+    from stylegravity.drift import DriftCurve
+    return DriftCurve(model=model, mode=mode, seed=seed,
+                      gravity=[], support=[], per_sample=samples)
+
+
+def test_contrast_signs_the_difference_toward_the_seed():
+    """Negative d_gravity must mean sustaining held the poem nearer the seed —
+    the whole condition is unreadable if that sign is ambiguous."""
+    from stylegravity.drift import paired_contrast
+    plain = _curve("prefill", [[0.5] * 6 for _ in range(5)])
+    sustain = _curve("prefill+sustain", [[-0.5] * 6 for _ in range(5)])
+    k = paired_contrast(plain, sustain)
+    assert k.d_gravity == pytest.approx(-1.0)
+    assert k.p_sustain_helps == 1.0
+    assert k.base_mode == "prefill"
+
+
+def test_contrast_recovers_a_delayed_reclamation():
+    from stylegravity.drift import paired_contrast
+    plain = _curve("prefill", [[0.5] * 6 for _ in range(5)])
+    sustain = _curve("prefill+sustain",
+                     [[-0.5, -0.5, 0.5, 0.5, 0.5, 0.5] for _ in range(5)])
+    k = paired_contrast(plain, sustain)
+    assert k.d_reclamation == pytest.approx(2.0)   # line 3 vs line 1
+    assert k.d_reclamation_ci is not None
+
+
+def test_contrast_reports_an_undefined_reclamation_rather_than_inventing_one():
+    """If an arm never crosses, the difference in crossing line does not exist.
+    Reporting it as the curve length would be a fabricated measurement."""
+    from stylegravity.drift import paired_contrast
+    plain = _curve("prefill", [[0.5] * 6 for _ in range(5)])
+    never = _curve("prefill+sustain", [[-0.5] * 6 for _ in range(5)])
+    k = paired_contrast(plain, never)
+    assert k.d_reclamation is None
+    assert k.d_reclamation_ci is None
+    assert "never reclaimed" in k.note
+
+
+def test_contrast_refuses_an_interval_it_cannot_support():
+    from stylegravity.drift import paired_contrast
+    k = paired_contrast(_curve("prefill", [[0.1] * 4]),
+                        _curve("prefill+sustain", [[0.1] * 4]))
+    assert k.d_gravity_ci is None
+    assert "fewer than 3" in k.note
+
+
+def test_analyse_pairs_every_sustain_cell_with_its_plain_twin():
+    from stylegravity.analysis import analyse
+    from stylegravity.generate import MODE_BASELINE
+    seed = resolve_seed("skaldic")
+    house = "The morning arrives quietly and I am learning to hold it gently.\n" * 6
+    recs = []
+    for i in range(4):
+        recs.append(Generation(model="m", mode=MODE_BASELINE, seed_id="-", sample=i,
+                               text=house, stop_reason="end_turn", input_tokens=1,
+                               output_tokens=1, cost_usd=0.0, prompt="p", prefill=None))
+    for mode, body in (("prefill", house), ("prefill+sustain", seed.text + "\n" + house)):
+        for i in range(4):
+            recs.append(Generation(model="m", mode=mode, seed_id="skaldic", sample=i,
+                                   text=body, stop_reason="end_turn", input_tokens=1,
+                                   output_tokens=1, cost_usd=0.0, prompt="p", prefill=None))
+    result = analyse(recs, min_support=2)
+    assert len(result.contrasts) == 1
+    assert result.contrasts[0].base_mode == "prefill"
+
+
+def test_every_sustain_cell_in_the_plan_has_an_unsustained_twin():
+    """A +sustain cell whose plain twin was never generated on the same model
+    cannot be contrasted with anything, so the condition buys nothing."""
+    from stylegravity.cli import _plan
+    cells = {(mid, m, s.id if s else "-") for mid, m, s, _i in _plan(_plan_args())}
+    for mid, mode, sid in cells:
+        base, _, suffix = mode.partition("+")
+        if suffix:
+            assert (mid, base, sid) in cells, f"{mid}/{mode}/{sid} has no plain twin"
+
+
+# --------------------------------------------------------------------------- #
+# feature space must not depend on which cells are in the run
+# --------------------------------------------------------------------------- #
+
+def test_scaler_round_trips_through_json():
+    import json
+    s = Scaler.fit([[0.0, 5.0], [2.0, 7.0], [4.0, 9.0]])
+    back = Scaler.from_dict(json.loads(json.dumps(s.to_dict())))
+    assert back.mean == s.mean and back.std == s.std
+
+
+def test_scaler_is_unchanged_by_adding_continuations():
+    """Re-analysing a subset must not move the feature space, or the same cell
+    scores differently inside a full run than it does on its own."""
+    from stylegravity.analysis import analyse
+    from stylegravity.generate import MODE_BASELINE
+    house = "The morning arrives quietly and I am learning to hold it gently.\n" * 6
+    base = [Generation(model="m", mode=MODE_BASELINE, seed_id="-", sample=i,
+                       text=house, stop_reason="end_turn", input_tokens=1,
+                       output_tokens=1, cost_usd=0.0, prompt="p", prefill=None)
+            for i in range(4)]
+    conts = [Generation(model="m", mode="prefill", seed_id=sid, sample=i,
+                        text=resolve_seed(sid).text + "\n" + house,
+                        stop_reason="end_turn", input_tokens=1, output_tokens=1,
+                        cost_usd=0.0, prompt="p", prefill=None)
+             for sid in ("skaldic", "legalese", "lipogram") for i in range(3)]
+    few = analyse(base + conts[:3], min_support=2).scaler
+    many = analyse(base + conts, min_support=2).scaler
+    assert few.mean == pytest.approx(many.mean)
+    assert few.std == pytest.approx(many.std)
+
+
+def test_there_are_three_independent_controls():
+    """One control cannot tell a broken metric from an unlucky draw."""
+    from stylegravity.seeds import CONTROL_SEEDS, resolve
+    assert len(CONTROL_SEEDS) == 3
+    texts = {resolve(c).text for c in CONTROL_SEEDS}
+    assert len(texts) == 3
+
+
+# --------------------------------------------------------------------------- #
+# batch pricing
+# --------------------------------------------------------------------------- #
+
+def test_batch_is_billed_at_half_rate():
+    from stylegravity.generate import _cost
+    from stylegravity.models import resolve as rm
+
+    class U:
+        input_tokens, output_tokens = 1000, 1000
+
+    spec = rm("claude-sonnet-4-5")
+    assert _cost(spec, U(), batch=True) == pytest.approx(_cost(spec, U()) / 2)
+
+
+def test_estimate_scales_with_lines_not_with_max_tokens_headroom():
+    """Billing is on tokens emitted. Leaving headroom must not look expensive,
+    or the estimate pushes you into truncating poems to save money you never
+    would have spent."""
+    from stylegravity.generate import estimate_jobs
+    jobs = [("claude-sonnet-4-5", "prefill", None, 0)] * 10
+    _u1, t1, _s1 = estimate_jobs(jobs, max_tokens=1200, n_lines=20)
+    _u2, t2, _s2 = estimate_jobs(jobs, max_tokens=4000, n_lines=20)
+    assert t1 == pytest.approx(t2)
+    _u3, t3, _s3 = estimate_jobs(jobs, max_tokens=1200, n_lines=10)
+    assert t3 < t1
+
+
+def test_batch_custom_ids_are_unique_and_within_the_api_limit():
+    from stylegravity.generate import _custom_id
+    ids = [_custom_id(i) for i in (0, 1, 999_999)]
+    assert len(set(ids)) == 3
+    assert all(len(i) <= 64 and i.replace("_", "").isalnum() for i in ids)

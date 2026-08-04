@@ -9,11 +9,18 @@ named style — not excerpts from published poems. That matters twice over: it
 avoids reproducing copyrighted work, and it keeps the seeds out of any model's
 training data, so a low drift score can't be explained by memorised completion.
 
-The `control` seed is the important one: it is written *in* the generic
-contemporary free-verse register that Claude models tend toward unprompted. Its
-drift curve should sit near zero from line one. If it doesn't, the metric is
-measuring something other than style reclamation and the run should be thrown
+The `control*` seeds are the important ones: they are written *in* the generic
+contemporary free-verse register that Claude models tend toward unprompted.
+Their drift curves should sit near zero from line one. If they don't, the metric
+is measuring something other than style reclamation and the run should be thrown
 out.
+
+There are three of them rather than one on purpose. A single control cannot
+distinguish "the metric is broken" from "this particular control happened to
+land off-centre at n=10" — one bad draw and you throw out a run that was fine,
+or keep one that wasn't. Three controls written independently in the same
+register turn that judgement into something you can actually read: all three
+near zero is a passing metric, one stray is noise, all three off is a fault.
 """
 
 from __future__ import annotations
@@ -46,6 +53,30 @@ quiet, and full of something like forgiveness.
 I am learning to hold the small things gently—
 the cup, the light, the hours that remain.
 Outside, the world continues without asking.""",
+    ),
+    Seed(
+        id="control_b",
+        name="House style (control B)",
+        category="control",
+        note="Second independent control. Same register, different imagery. Expected drift ≈ 0.",
+        text="""\
+There is a kind of silence that arrives in kitchens,
+after the water has been put on, before it speaks.
+My mother kept her hands busy for sixty years
+and never once explained what she was holding off.
+I am beginning to understand the arrangement.""",
+    ),
+    Seed(
+        id="control_c",
+        name="House style (control C)",
+        category="control",
+        note="Third independent control. Same register, different imagery. Expected drift ≈ 0.",
+        text="""\
+Somewhere a door is closing very slowly,
+and the light goes with it, and I let it go.
+We are all of us practising for the larger leaving—
+the coat by the stairs, the note left unwritten,
+whatever we meant by tenderness, still meaning it.""",
     ),
     Seed(
         id="skaldic",
@@ -187,6 +218,12 @@ SEEDS_BY_ID = {s.id: s for s in SEEDS}
 #  Small default sweep: control + the three seeds with the sharpest, most
 #  independently checkable signals (form, constraint, register).
 DEFAULT_SEEDS = ["control", "skaldic", "monosyllabic", "legalese"]
+
+#  Every control, in order. The `full` preset carries all three through the
+#  depth tier so the validity check has three readings rather than one; the
+#  cheaper presets carry only the first, since a smoke test does not need a
+#  three-way agreement it has no samples to support.
+CONTROL_SEEDS = [s.id for s in SEEDS if s.category == "control"]
 
 
 def resolve(seed_id: str) -> Seed:

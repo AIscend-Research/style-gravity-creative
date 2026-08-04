@@ -81,17 +81,35 @@ an embedding model's own priors would sit between the measurement and the thing 
 embedding distance is dominated by topic rather than style. Each feature is z-scored across the
 whole run so a unit of distance means the same thing in every comparison.
 
+**One feature space, fixed by the poles.** The z-scaler is fitted on the seed texts (static, in
+the repo) plus the run's baselines — the two poles the metric is defined against — and never on
+the continuations, which are the thing being measured. Fitting on the continuations, as an
+earlier version did, made the scale depend on which cells happened to be in the run, so
+`analyse --seeds x` disagreed with the same cell inside a full run. The fitted scaler is written
+into `drift.json` and reused on re-analysis, so a cached run re-scores to the same numbers
+indefinitely.
+
 **Two headline numbers.** The *reclamation line* is the first continuation line from which the
 curve stays on the house-style side of zero for `--window` consecutive lines (default 2 — a
 single crossing and back is a wobble, not a takeover). The *half-life* is the line at which
 drift has covered half the distance from its opening value to its settled value. They answer
 different questions: when the model wins, versus how fast it is winning.
 
+**And one contrast, which is the actual claim.** Every cell is compared against its `+sustain`
+twin by a bootstrap on the *difference*, not by eyeballing two intervals against each other —
+overlapping CIs are not a test and non-overlapping ones are a conservative one. Reported as
+`Δgravity` (negative means asking held the poem nearer the seed) with a 95% interval, plus the
+difference in reclamation line whenever both arms actually crossed. When one arm never crosses,
+that difference does not exist and is reported as undefined rather than as the curve length.
+
 ### Validity checks, because this metric can lie
 
-- **A control seed.** `control` is written *in* the generic contemporary free-verse register
-  models default to. Its curve should sit near zero from line one. If it doesn't, the metric is
-  measuring something other than style reclamation and the run should be discarded.
+- **Three control seeds.** `control`, `control_b` and `control_c` are written *in* the generic
+  contemporary free-verse register models default to. Their curves should sit near zero from
+  line one. If they don't, the metric is measuring something other than style reclamation and
+  the run should be discarded. Three rather than one because a single control cannot separate
+  "the metric is broken" from "this control landed off-centre on one draw" — all three near zero
+  is a pass, one stray is noise, all three off is a fault. `analyse` prints the verdict.
 - **Pole separation.** If the seed and the model's baseline occupy the same region of feature
   space, the seed wasn't off-distribution for that model and its curve is meaningless. Cells
   below a separation threshold are flagged invalid rather than reported as a number.
@@ -100,6 +118,7 @@ different questions: when the model wins, versus how fast it is winning.
   separable; anything else is surfaced as a warning in the report.
 - **Bootstrapped CI**, resampling whole generations rather than lines — lines within one poem
   are not independent draws, and treating them as such would make the interval far too tight.
+  The same resampling unit is used for the `+sustain` contrast.
 - **Seed-echo stripping.** In `instructed` mode models often restate the opening before
   continuing. Those lines are the seed, not a response to it; leaving them in would manufacture
   a stretch of perfect fidelity and inflate exactly the number being measured.
@@ -107,8 +126,8 @@ different questions: when the model wins, versus how fast it is winning.
 
 ### Seeds
 
-Twelve openings across five categories — `borrowed_style`, `register_clash`, `constrained`,
-`broken_form`, and the `control`. All are **original text written for this experiment** in the
+Fourteen openings across five categories — `borrowed_style`, `register_clash`, `constrained`,
+`broken_form`, and three `control`s. All are **original text written for this experiment** in the
 manner of the named style, never excerpts from published poems. That matters twice: it avoids
 reproducing copyrighted work, and it keeps the seeds out of any model's training data, so a low
 drift score cannot be explained away as memorised completion.
@@ -151,34 +170,47 @@ python -m venv .venv && .venv/bin/pip install -e .
 export ANTHROPIC_API_KEY=...          # or: ant auth login
 
 python -m stylegravity presets                          # what each preset runs
-python -m stylegravity estimate --preset full           # cost + wall clock, no API calls
-python -m stylegravity run --preset full --run-dir runs/full
+python -m stylegravity estimate --preset full --lines 20 # cost + wall clock, no API calls
+python -m stylegravity run --preset full --lines 20 --batch --run-dir runs/full
 python -m stylegravity analyse --run-dir runs/full      # re-score, no API calls
 ```
 
-| preset | calls | typical cost | wall clock @ `--concurrency 8` | what it is |
-|---|---|---|---|---|
-| `pilot` | 26 | $0.11 | <1 min | smoke test, one model |
-| `default` | 84 | $1.03 | ~1 min | core sweep, prefill only |
-| `full` | 940 | **$12.22** (ceiling $18.81) | **~15 min** | the whole paper |
+At `--lines 20`:
 
-`full` is a deliberate two-tier design, not a full factorial: all twelve seeds in the headline
-condition (breadth), four conditions on the four core seeds (depth), plus the current-generation
-models on the instructed channel. Crossing everything would quadruple the bill to answer
-questions no one asked.
+| preset | calls | typical | with `--batch` | wall clock @ `-c 8` | what it is |
+|---|---|---|---|---|---|
+| `pilot` | 26 | $0.05 | $0.02 | <1 min | smoke test, one model |
+| `default` | 84 | $0.46 | $0.23 | ~1 min | core sweep, prefill only |
+| `full` | 1596 | $9.36 | **$4.68** | ~22 min | the whole paper |
 
-Cost estimates assume every generation runs to `--max-tokens`; real spend lands near the
-"typical" column because poems stop on their own. The time figure is derived from published
-throughput and **ignores rate-limit backoff** — on a low API tier, 429s dominate it. Drop
-`--concurrency` if you see them.
+**`--batch` submits the identical requests through the Message Batches API at half price.** Same
+models, same parameters, same sampling — only the bill and the latency differ. The SLA is up to
+24 hours (usually far less), which is free if you are not watching the terminal. Batch ids are
+written to `batches.json` before polling starts, so an interrupted run resumes rather than
+resubmitting work you have already paid for.
 
-A run writes three files to `--run-dir`:
+`full` is a deliberate two-tier design, not a full factorial. **Breadth**: all fourteen seeds on
+the cheaper prefill-capable tiers at n=6 — showing the effect replicates across seeds needs
+seeds, not samples. **Depth**: all four conditions on every prefill-capable model, six seeds
+(the four core plus the two extra controls) at n=15, which is where the `+sustain` contrast and
+all the inference live. Plus the current-generation models on the instructed channel. Crossing
+everything would quadruple the bill to answer questions no one asked.
+
+The *ceiling* assumes every generation runs to `--max-tokens`; the *typical* figure is derived
+from `--lines`, because billing is on tokens emitted and a poem stops when it stops. Leaving
+generous `--max-tokens` headroom therefore costs nothing — lowering it saves no money and only
+risks truncation. The time figure is derived from published throughput and **ignores rate-limit
+backoff** — on a low API tier, 429s dominate it. Drop `--concurrency` if you see them, or use
+`--batch` and stop caring.
+
+A run writes to `--run-dir`:
 
 | file | what it is |
 |---|---|
 | `generations.jsonl` | every raw poem, append-only, with usage and cost |
-| `drift.json` | per-line curves and all summary statistics |
+| `drift.json` | per-line curves, the `+sustain` contrasts, the fitted scaler |
 | `report.html` | self-contained report — no CDN, no build step, opens anywhere |
+| `batches.json` | in-flight batch ids, under `--batch`; removed once results land |
 
 Generation is the expensive part; analysis is free. Caching the raw poems means the metric can
 be re-tuned and re-argued about without spending another cent, and it leaves every number
@@ -193,17 +225,26 @@ Useful knobs: `--models`, `--seeds`, `--samples`, `--concurrency`, `--lines`, `-
 
 ## Prior work
 
-The visual-domain precedent is the *Patterns* paper on generative-model style convergence,
-cited here for the same reason [Transcription Gap](../transcription-gap) cites it: it
-establishes that the pull toward a model's own aesthetic centre is measurable in images, and
-this project asks whether the same pull is measurable line by line in text, where the decay has
-an ordering that images do not.
+The visual-domain precedent is:
 
-> **Citation incomplete — needs your input.** I could not recover the exact reference from this
-> machine: the Transcription Gap repo has no citation section or bibliography to copy it from.
-> Rather than fabricate authors, a year, or a DOI, the reference is left as a placeholder. Drop
-> the full citation in here — and ideally into Transcription Gap too, so the two agree — before
-> this goes anywhere public.
+> Arend Hintze, Frida Proschinger Åström, and Jory Schossau. "Autonomous language-image
+> generation loops converge to generic visual motifs." *Patterns* 7, no. 1 (January 2026):
+> 101451. <https://doi.org/10.1016/j.patter.2025.101451>
+
+Cited here for the same reason [Transcription Gap](../transcription-gap) cites it: it
+establishes that the pull toward a model's own aesthetic centre is measurable, and that the
+destination is a small set of generic attractors rather than a drift in no particular direction.
+Hintze et al. drive an SDXL↔LLaVA loop for 100 iterations across 700 trajectories and find every
+run collapsing onto twelve commercially safe motifs — lighthouses, cathedrals, palatial
+interiors — robust to model swap, longer prompts, and raised sampling temperature.
+
+Two differences define this project against it. Theirs is a **cross-turn** result: convergence
+emerges from repeatedly round-tripping through the model, and the unit of decay is the
+iteration. This asks whether the same pull is visible **within a single continuation**, where
+the decay has a line-by-line ordering that an iterated loop does not — and where no re-encoding
+step is available to explain the collapse. And their attractor is characterised by *content*
+(what the images depict); this one is characterised by *style* (diction, morphology, register,
+form), measured against each model's own unprompted pole rather than a shared visual census.
 
 ---
 
@@ -222,8 +263,16 @@ an ordering that images do not.
   a distance metric needs, but the absolute `syllables_per_word` numbers are not prosody.
 - Line-index alignment assumes the model writes one poetic line per output line. Blank lines are
   dropped, but a wrapped long line still registers as two.
-- `temperature=1.0` and n=5 per cell by default. Enough to see a large effect, not enough to
-  resolve a small one — read the CI, not the point estimate.
+- **Every model is a Claude model.** "The model's house style" therefore means *Anthropic's*
+  house style, and the pull documented here is a case study rather than a demonstrated property
+  of generative text models in general. Hintze et al. deliberately showed their convergence held
+  across model families; this does not, and the claim is scoped accordingly. Adding another
+  vendor is not a config change — the generator is bound to one API and to its prefill
+  semantics, and whether trailing-assistant continuation even behaves the same way elsewhere is
+  its own empirical question.
+- `temperature=1.0`, n=15 per cell in the depth tier and n=6 in breadth. Enough to see a large
+  effect, not enough to resolve a small one — read the CI, not the point estimate. The breadth
+  tier in particular is for replication, not inference.
 
 ---
 
@@ -232,14 +281,14 @@ an ordering that images do not.
 ```
 stylegravity/
   models.py     model registry + prefill capability (the constraint that shapes everything)
-  seeds.py      twelve original off-distribution openings + the control
+  seeds.py      eleven original off-distribution openings + three controls
   features.py   24 surface-stylometric features per line
-  generate.py   prefill / instructed / baseline calls, JSONL cache, cost estimator
-  drift.py      z-scaling, two-pole gravity, reclamation point, half-life, bootstrap
-  analysis.py   generations → curves
+  generate.py   prefill / instructed / baseline calls, batch submission, JSONL cache, estimator
+  drift.py      z-scaling, two-pole gravity, reclamation point, half-life, bootstrap, contrast
+  analysis.py   generations → curves → +sustain contrasts
   report.py     self-contained HTML + hand-built SVG
   cli.py        estimate / run / analyse / seeds / models
-tests/          37 tests, no API calls
+tests/          60 tests, no API calls
 ```
 
 Run the tests with `.venv/bin/python -m pytest tests -q`.

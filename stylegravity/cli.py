@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import threading
 import time
@@ -17,29 +18,49 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .analysis import analyse as analyse_records
+from .drift import Scaler
 from .generate import (
     MODE_BASELINE, MODE_INSTRUCTED, MODE_PREFILL, SUSTAIN,
-    GenerationStore, estimate_jobs, generate, make_client, split_mode,
+    GenerationStore, collect_batches, estimate_jobs, generate, make_client,
+    poll_batches, split_mode, submit_batches,
 )
 from .models import DEFAULT_MODELS, REGISTRY, resolve as resolve_model
 from .report import write_report
-from .seeds import DEFAULT_SEEDS, SEEDS, resolve as resolve_seed
+from .seeds import CONTROL_SEEDS, DEFAULT_SEEDS, SEEDS, resolve as resolve_seed
 
 ALL_SEEDS = [s.id for s in SEEDS]
 CORE_SEEDS = DEFAULT_SEEDS                       # control + skaldic + monosyllabic + legalese
+#  The depth tier carries every control, not just the first: the validity check
+#  it supports is "do the controls sit near zero", and one reading cannot tell a
+#  broken metric from an unlucky draw. The cheap presets keep a single control —
+#  a smoke test has no samples to support a three-way agreement anyway.
+DEPTH_SEEDS = CORE_SEEDS + [s for s in CONTROL_SEEDS if s not in CORE_SEEDS]
 PREFILL_MODELS = [m for m, s in REGISTRY.items() if s.prefill and m in DEFAULT_MODELS]
 CURRENT_MODELS = ["claude-opus-5", "claude-sonnet-5"]
+
+#  Breadth does not need the priciest model or a large n: its job is to show the
+#  effect replicates across fourteen seeds, and the statistics come from the
+#  depth tier. Opus stays where the sustain contrast actually lives.
+BREADTH_MODELS = [m for m in PREFILL_MODELS if m != "claude-opus-4-5"]
+BREADTH_SAMPLES = 6
 
 WITH_SUSTAIN = f"+{SUSTAIN}"
 
 
 @dataclass(frozen=True)
 class Block:
-    """One factorial slab of the design: models × seeds × modes × samples."""
+    """One factorial slab of the design: models × seeds × modes × samples.
+
+    ``samples`` overrides the run-wide count for this block alone. Breadth and
+    depth want different n — breadth is replication across seeds, depth carries
+    the inference — and forcing one number on both means either paying for
+    precision where it is not used or not having it where it is.
+    """
     models: list[str]
     seeds: list[str]
     modes: list[str]
     note: str
+    samples: int | None = None
 
 
 #  The `full` preset is a deliberate two-tier design rather than a full
@@ -59,17 +80,22 @@ PRESETS: dict[str, tuple[list[Block], int]] = {
     "full": (
         [
             Block(
-                PREFILL_MODELS, ALL_SEEDS, [MODE_PREFILL],
-                "headline: every seed, every prefill-capable model",
+                BREADTH_MODELS, ALL_SEEDS, [MODE_PREFILL],
+                "breadth: every seed, at the cheaper prefill-capable tiers — "
+                "shows the effect replicates across seeds, which needs seeds, not n",
+                samples=BREADTH_SAMPLES,
             ),
             Block(
-                PREFILL_MODELS, CORE_SEEDS,
-                [MODE_PREFILL + WITH_SUSTAIN, MODE_INSTRUCTED, MODE_INSTRUCTED + WITH_SUSTAIN],
-                "condition contrast on one model — de-confounds channel from model, "
-                "and measures what asking for style can recover that prefill gave for free",
+                PREFILL_MODELS, DEPTH_SEEDS,
+                [MODE_PREFILL, MODE_PREFILL + WITH_SUSTAIN,
+                 MODE_INSTRUCTED, MODE_INSTRUCTED + WITH_SUSTAIN],
+                "depth: all four conditions on every prefill-capable model. Carries the "
+                "central contrast, so it includes the plain `prefill` arm at full n even "
+                "though breadth also covers part of it — a +sustain cell with no matching "
+                "unsustained twin on the same model is not a contrast at all",
             ),
             Block(
-                CURRENT_MODELS, CORE_SEEDS,
+                CURRENT_MODELS, DEPTH_SEEDS,
                 [MODE_INSTRUCTED, MODE_INSTRUCTED + WITH_SUSTAIN],
                 "current-generation models, instructed channel only (prefill returns 400 there)",
             ),
@@ -94,6 +120,10 @@ def _add_shared(p: argparse.ArgumentParser) -> None:
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--concurrency", type=int, default=8,
                    help="parallel API calls (default 8; lower it if you hit 429s)")
+    p.add_argument("--batch", action="store_true",
+                   help="submit via the Message Batches API at half price. Same models, "
+                        "same params, same sampling — only the bill and the latency "
+                        "differ (SLA is up to 24h, usually far less)")
 
 
 def _plan(args) -> list[tuple[str, str, object, int]]:
@@ -104,7 +134,7 @@ def _plan(args) -> list[tuple[str, str, object, int]]:
     scored at all.
     """
     blocks, default_baselines = PRESETS[args.preset]
-    samples = args.samples if args.samples is not None else (10 if args.preset == "full" else 5)
+    samples = args.samples if args.samples is not None else (15 if args.preset == "full" else 5)
     n_base = args.baseline_samples if args.baseline_samples is not None else default_baselines
 
     blocks = [
@@ -112,6 +142,9 @@ def _plan(args) -> list[tuple[str, str, object, int]]:
             [m for m in b.models if args.models is None or m in args.models],
             [s for s in b.seeds if args.seeds is None or s in args.seeds],
             b.modes, b.note,
+            #  An explicit --samples overrides a block's own n; without one, the
+            #  block keeps the count the design chose for it.
+            samples=b.samples if args.samples is None else args.samples,
         )
         for b in blocks
     ]
@@ -136,7 +169,7 @@ def _plan(args) -> list[tuple[str, str, object, int]]:
                 if base == MODE_PREFILL and not spec.prefill:
                     continue     # 400s on this model; the block below covers it
                 for sid in b.seeds:
-                    for i in range(samples):
+                    for i in range(b.samples if b.samples is not None else samples):
                         key = (m, mode, sid, i)
                         if key in emitted:
                             continue
@@ -176,19 +209,27 @@ def cmd_presets(args) -> int:
 
 
 def _summarise_plan(args, jobs) -> None:
+    batch = getattr(args, "batch", False)
     upper, typical, seconds = estimate_jobs(
-        jobs, max_tokens=args.max_tokens, concurrency=args.concurrency
+        jobs, max_tokens=args.max_tokens, concurrency=args.concurrency,
+        batch=batch, n_lines=args.lines,
     )
     by_mode: dict[str, int] = {}
     for _m, mode, _s, _i in jobs:
         by_mode[mode] = by_mode.get(mode, 0) + 1
-    print(f"preset: {args.preset}   {len(jobs)} API calls")
+    print(f"preset: {args.preset}   {len(jobs)} API calls"
+          f"{'   (batch, half price)' if batch else ''}")
     for mode, n in sorted(by_mode.items()):
         print(f"  {mode:<22} {n:>5}")
-    print(f"\ncost   upper bound ${upper:.2f}   typical ${typical:.2f}")
-    print(f"time   ~{seconds / 60:.0f} min at --concurrency {args.concurrency} "
-          f"(~{seconds * args.concurrency / 3600:.1f} h serial)")
-    print("       estimate from published throughput; ignores rate-limit backoff")
+    print(f"\ncost   typical ${typical:.2f}   ceiling ${upper:.2f} "
+          f"(if every poem ran to --max-tokens {args.max_tokens})")
+    if batch:
+        print("time   batch SLA is up to 24h; usually far less. Wall clock is not "
+              "a function of size here.")
+    else:
+        print(f"time   ~{seconds / 60:.0f} min at --concurrency {args.concurrency} "
+              f"(~{seconds * args.concurrency / 3600:.1f} h serial)")
+        print("       estimate from published throughput; ignores rate-limit backoff")
 
 
 def cmd_estimate(args) -> int:
@@ -218,9 +259,13 @@ def cmd_run(args) -> int:
         return _analyse(run_dir, store, args)
 
     client = make_client()
+    started = time.monotonic()
+
+    if args.batch:
+        return _run_batched(args, run_dir, store, client, todo, started)
+
     counter = {"done": 0, "failed": 0}
     lock = threading.Lock()
-    started = time.monotonic()
 
     def work(job):
         mid, mode, seed, sample = job
@@ -266,6 +311,62 @@ def cmd_run(args) -> int:
     return _analyse(run_dir, store, args)
 
 
+def _run_batched(args, run_dir: Path, store: GenerationStore, client, todo, started) -> int:
+    """Submit ``todo`` as batches, wait, collect.
+
+    The batch ids and their custom_id mapping are written to disk *before* the
+    poll begins. Batches survive the process that created them, so a run
+    interrupted while waiting must be recoverable — without the mapping on disk
+    the results would still exist and still be billed, but nothing could say
+    which cell each one belonged to.
+    """
+    state_path = run_dir / "batches.json"
+    if state_path.exists():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        batch_ids = state["batch_ids"]
+        mapping = {k: tuple(v) for k, v in state["mapping"].items()}
+        print(f"resuming {len(batch_ids)} batch(es) from {state_path}\n")
+    else:
+        batch_ids, mapping = submit_batches(
+            client, todo, n_lines=args.lines, max_tokens=args.max_tokens,
+            temperature=args.temperature,
+        )
+        if not batch_ids:
+            print("nothing submittable", file=sys.stderr)
+            return 1
+        state_path.write_text(
+            json.dumps({"batch_ids": batch_ids, "mapping": {k: list(v) for k, v in mapping.items()}},
+                       indent=2),
+            encoding="utf-8",
+        )
+        print(f"submitted {len(mapping)} requests in {len(batch_ids)} batch(es)")
+        print(f"batch ids written to {state_path} — safe to interrupt and re-run\n")
+
+    def on_status(done_batches, total_batches, counts):
+        print(f"[{done_batches}/{total_batches} batches ended] "
+              f"{counts['succeeded']} ok · {counts['processing']} processing · "
+              f"{counts['errored']} errored · {(time.monotonic() - started) / 60:.0f} min elapsed",
+              flush=True)
+
+    poll_batches(client, batch_ids, on_status=on_status)
+
+    gens, errors = collect_batches(client, batch_ids, mapping, n_lines=args.lines)
+    for gen in gens:
+        store.add(gen)
+    for err in errors:
+        print(f"    FAILED {err}", file=sys.stderr)
+    if errors:
+        print(f"\n{len(errors)} generations failed; re-run to retry only those "
+              "(everything else is cached)", file=sys.stderr)
+
+    #  Cleared only once the results are safely in the store, so an interrupted
+    #  collect re-reads the same batches rather than resubmitting them at cost.
+    state_path.unlink(missing_ok=True)
+    print(f"\nspent ${store.total_cost():.2f} across {len(store.records)} generations "
+          f"in {(time.monotonic() - started) / 60:.1f} min")
+    return _analyse(run_dir, store, args)
+
+
 def cmd_analyse(args) -> int:
     run_dir = Path(args.run_dir)
     store = GenerationStore(run_dir / "generations.jsonl")
@@ -276,8 +377,24 @@ def cmd_analyse(args) -> int:
 
 
 def _analyse(run_dir: Path, store: GenerationStore, args) -> int:
-    result = analyse_records(store.records, window=args.window, max_lines=args.lines)
-    result.write_json(run_dir / "drift.json")
+    #  Reuse the feature space the run was originally scored in, if there is
+    #  one. Re-fitting is safe now that the reference is seeds + baselines, but
+    #  reusing it makes re-analysis exactly reproducible even if the baseline
+    #  set later grows.
+    scaler = None
+    drift_path = run_dir / "drift.json"
+    if getattr(args, "refit", False) is False and drift_path.exists():
+        try:
+            prior = json.loads(drift_path.read_text(encoding="utf-8"))
+            if "scaler" in prior:
+                scaler = Scaler.from_dict(prior["scaler"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            scaler = None
+
+    result = analyse_records(
+        store.records, window=args.window, max_lines=args.lines, scaler=scaler
+    )
+    result.write_json(drift_path)
     report = write_report(
         run_dir / "report.html",
         curves=result.curves,
@@ -291,6 +408,33 @@ def _analyse(run_dir: Path, store: GenerationStore, args) -> int:
         recl = c.reclamation_line or f">{len(c.gravity)}"
         half = c.half_reclamation_line or "—"
         print(f"{c.model:<20} {c.mode:<20} {c.seed:<15} {str(recl):>10} {str(half):>10}")
+
+    #  The controls are the run's pass/fail. They are written in the register the
+    #  models default to, so their curves should sit near zero; if they do not,
+    #  the metric is measuring something other than style reclamation and no
+    #  other row on this table means anything.
+    ctrl = [c for c in result.curves if c.seed.startswith("control")]
+    if ctrl:
+        openings = [c.opening_gravity for c in ctrl if c.opening_gravity is not None]
+        if openings:
+            worst = max(abs(o) for o in openings)
+            verdict = "PASS" if worst < 0.35 else "SUSPECT — inspect before trusting anything above"
+            print(f"\ncontrols: {len(ctrl)} curves, largest |opening gravity| = "
+                  f"{worst:.3f}   {verdict}")
+
+    if result.contrasts:
+        print(f"\n{'model':<20} {'channel':<12} {'seed':<15} "
+              f"{'Δgravity':>10} {'95% CI':>18} {'P(helps)':>9} {'Δreclaim':>9}")
+        for k in sorted(result.contrasts, key=lambda k: (k.seed, k.base_mode, k.model)):
+            ci = (f"[{k.d_gravity_ci[0]:+.3f}, {k.d_gravity_ci[1]:+.3f}]"
+                  if k.d_gravity_ci else "—")
+            p = f"{k.p_sustain_helps:.2f}" if k.p_sustain_helps is not None else "—"
+            dr = f"{k.d_reclamation:+.0f}" if k.d_reclamation is not None else "—"
+            print(f"{k.model:<20} {k.base_mode:<12} {k.seed:<15} "
+                  f"{k.d_gravity:>+10.3f} {ci:>18} {p:>9} {dr:>9}")
+        print("  Δgravity < 0 means asking for the style held the poem nearer the seed.")
+        print("  P(helps) is the bootstrap fraction of resamples in that direction.")
+
     print(f"\nwrote {run_dir/'drift.json'} and {report}")
     return 0
 
@@ -319,6 +463,10 @@ def main(argv: list[str] | None = None) -> int:
     _add_shared(p_an)
     p_an.add_argument("--run-dir", default="runs/latest")
     p_an.add_argument("--window", type=int, default=2)
+    p_an.add_argument("--refit", action="store_true",
+                      help="re-fit the feature scaler instead of reusing the one stored in "
+                           "drift.json (use after adding models, whose baselines widen the "
+                           "reference set)")
     p_an.set_defaults(func=cmd_analyse)
 
     args = ap.parse_args(argv)

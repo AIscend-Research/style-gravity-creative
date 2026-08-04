@@ -33,21 +33,34 @@ Vector = Sequence[float]
 # scaling
 # --------------------------------------------------------------------------- #
 
+#  A feature whose reference variance is this small carries no usable signal,
+#  and dividing by it would turn rounding noise into many standard deviations of
+#  apparent distance. Such features are given unit scale so they contribute
+#  their raw (tiny) difference instead of an amplified one.
+MIN_STD = 1e-4
+
+
 @dataclass
 class Scaler:
-    """Z-scores each feature against the whole run.
+    """Z-scores each feature against a fixed *reference* set of lines.
 
-    Fitted once on every line the run produced — seeds, continuations,
-    baselines — so that a unit of distance means the same thing in every
-    comparison. A feature with no variance across the run carries no
-    information and is given unit scale so it contributes zero.
+    The reference is the twelve-plus seed texts (static, in the repo) together
+    with the run's baseline generations — that is, the two poles the metric is
+    defined against, and nothing else.
+
+    Fitting on the *continuations* instead, as an earlier version did, made the
+    feature space depend on which cells happened to be in the run: re-analysing
+    a subset re-fitted the scaler, so every distance changed and the numbers
+    from ``analyse --seeds x`` did not match the same cell inside a full run.
+    Distances have to mean the same thing across runs for the cached-generations
+    argument to hold, so the reference is now something a subset cannot move.
     """
 
     mean: list[float]
     std: list[float]
 
     @classmethod
-    def fit(cls, vectors: Sequence[Vector]) -> "Scaler":
+    def fit(cls, vectors: Sequence[Vector], *, min_std: float = MIN_STD) -> "Scaler":
         if not vectors:
             raise ValueError("cannot fit a scaler on zero vectors")
         n = len(vectors)
@@ -57,7 +70,7 @@ class Scaler:
         for j in range(dim):
             var = sum((v[j] - mean[j]) ** 2 for v in vectors) / max(n - 1, 1)
             s = math.sqrt(var)
-            std.append(s if s > 1e-9 else 1.0)
+            std.append(s if s > min_std else 1.0)
         return cls(mean=mean, std=std)
 
     def transform(self, v: Vector) -> list[float]:
@@ -65,6 +78,13 @@ class Scaler:
 
     def transform_all(self, vs: Sequence[Vector]) -> list[list[float]]:
         return [self.transform(v) for v in vs]
+
+    def to_dict(self) -> dict:
+        return {"mean": list(self.mean), "std": list(self.std)}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Scaler":
+        return cls(mean=list(d["mean"]), std=list(d["std"]))
 
 
 def centroid(vectors: Sequence[Vector]) -> list[float]:
@@ -334,5 +354,132 @@ def _loo_self_gravity(
 
 
 def fit_run_scaler(all_vectors: Sequence[Vector]) -> Scaler:
+    """Fit on the reference set — seed texts plus baselines. See ``Scaler``."""
     vs = [v for v in all_vectors if len(v) == N_FEATURES]
     return Scaler.fit(vs)
+
+
+# --------------------------------------------------------------------------- #
+# paired contrast: a cell against its +sustain twin
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Contrast:
+    """One cell against its ``+sustain`` twin, same model and same seed.
+
+    This is the experiment's central comparison, so it needs an inference
+    procedure of its own rather than two per-cell intervals eyeballed against
+    each other: overlapping CIs are not a test, and non-overlapping ones are a
+    conservative one.
+
+    Two statistics, because the obvious one is not always defined. ``d_gravity``
+    is the difference in mean gravity across the curve — always available, and
+    negative when sustaining held the poem nearer the seed. ``d_reclamation`` is
+    the difference in the line at which the house style took over, which is the
+    number a reader wants but is undefined whenever either arm never crossed.
+    """
+
+    model: str
+    seed: str
+    base_mode: str
+    d_gravity: float
+    d_gravity_ci: tuple[float, float] | None
+    p_sustain_helps: float | None
+    d_reclamation: float | None
+    d_reclamation_ci: tuple[float, float] | None
+    n_plain: int
+    n_sustain: int
+    note: str | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _mean_gravity(samples: Sequence[Sequence[float]]) -> float | None:
+    """Mean gravity over every scored line of every generation in one arm."""
+    vals = [g for s in samples for g in s]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _mean_curve(samples: Sequence[Sequence[float]], *, min_frac: float = 0.5) -> list[float]:
+    if not samples:
+        return []
+    need = max(2, int(len(samples) * min_frac))
+    out: list[float] = []
+    for i in range(max(len(s) for s in samples)):
+        vals = [s[i] for s in samples if i < len(s)]
+        if len(vals) < need:
+            break
+        out.append(sum(vals) / len(vals))
+    return out
+
+
+def paired_contrast(
+    plain: "DriftCurve",
+    sustain: "DriftCurve",
+    *,
+    window: int = 2,
+    iterations: int = 4000,
+    seed: int = 0,
+) -> Contrast:
+    """Bootstrap the difference between a cell and its ``+sustain`` twin.
+
+    The two arms are separate generations, not repeated measures on the same
+    poem, so each is resampled independently — this is a two-sample bootstrap
+    wearing the word "paired" only in the sense that the cells are matched on
+    model and seed. Whole generations are the resampling unit here for the same
+    reason as everywhere else in this file: lines within a poem are not
+    independent draws.
+    """
+    base_mode, _ = (sustain.mode.partition("+")[0], True)
+    a = [s for s in plain.per_sample if s]
+    b = [s for s in sustain.per_sample if s]
+
+    g_a, g_b = _mean_gravity(a), _mean_gravity(b)
+    point = (g_b - g_a) if (g_a is not None and g_b is not None) else 0.0
+
+    if len(a) < 3 or len(b) < 3:
+        return Contrast(
+            model=plain.model, seed=plain.seed, base_mode=base_mode,
+            d_gravity=point, d_gravity_ci=None, p_sustain_helps=None,
+            d_reclamation=None, d_reclamation_ci=None,
+            n_plain=len(a), n_sustain=len(b),
+            note="fewer than 3 usable generations in one arm; no interval computed",
+        )
+
+    rng = random.Random(seed)
+    d_g: list[float] = []
+    d_r: list[float] = []
+    for _ in range(iterations):
+        ra = [a[rng.randrange(len(a))] for _ in range(len(a))]
+        rb = [b[rng.randrange(len(b))] for _ in range(len(b))]
+        ga, gb = _mean_gravity(ra), _mean_gravity(rb)
+        if ga is not None and gb is not None:
+            d_g.append(gb - ga)
+        ka = first_sustained_crossing(_mean_curve(ra), window=window)
+        kb = first_sustained_crossing(_mean_curve(rb), window=window)
+        if ka is not None and kb is not None:
+            d_r.append(float(kb - ka))
+
+    def ci(xs: list[float]) -> tuple[float, float] | None:
+        if len(xs) < iterations * 0.5:
+            return None
+        xs = sorted(xs)
+        return (xs[int(0.025 * len(xs))], xs[min(int(0.975 * len(xs)), len(xs) - 1)])
+
+    #  "Helps" means holding the poem nearer the seeded pole, i.e. a *lower*
+    #  gravity under sustain. Reported as a bootstrap proportion, not a p-value:
+    #  it is the fraction of resamples in which asking made a difference in the
+    #  direction the sustain condition predicts.
+    p_helps = (sum(1 for x in d_g if x < 0) / len(d_g)) if d_g else None
+    med_r = sorted(d_r)[len(d_r) // 2] if d_r else None
+
+    return Contrast(
+        model=plain.model, seed=plain.seed, base_mode=base_mode,
+        d_gravity=point, d_gravity_ci=ci(d_g), p_sustain_helps=p_helps,
+        d_reclamation=med_r, d_reclamation_ci=ci(d_r),
+        n_plain=len(a), n_sustain=len(b),
+        note=None if d_r else "one or both arms never reclaimed in most resamples; "
+                              "the reclamation difference is undefined and only the "
+                              "gravity difference is reported",
+    )
